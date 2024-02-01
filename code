@@ -1,0 +1,199 @@
+with dot as (
+select b.*, a.is_active
+from core.carriers.dot_carriers a
+left join core.fmcsa.sfdc_to_dot_id_mapping b on a.dot_id::varchar = b.dot_id
+)
+, contact as (
+select account_id, id, name, phone, email, title, role_c
+from db_wh.salesforce.contact
+where not is_deleted
+and (role_c not in ('Driver','Company Rep','COMPANY DRIVER') or role_c is null)
+)
+, contact_agg as (
+select account_id, count(*) as contact_count, count(case when not email ilike any ('%gmail%','%yahoo%','%aol%') and email is not null then id end) as validated_email_count
+from contact
+group by 1
+)
+, hierarchy as (
+select a.sfdc_account_id as ultimate_parent_id, b.sfdc_account_id as child_id_1, b.account_status_reason_c as account_status_reason_child_1, 
+       c.sfdc_account_id as child_id_2, c.account_status_reason_c as account_status_reason_child_2, 
+       d.sfdc_account_id as child_id_3, d.account_status_reason_c as account_status_reason_child_3, 
+       e.sfdc_account_id as child_id_4, e.account_status_reason_c as account_status_reason_child_4, 
+       f.sfdc_account_id as child_id_5, f.account_status_reason_c as account_status_reason_child_5, 
+       g.sfdc_account_id as child_id_6, g.account_status_reason_c as account_status_reason_child_6
+from core.fleet_crm.accounts a
+left join core.fleet_crm.accounts b on a.sfdc_account_id = b.parent_id
+left join core.fleet_crm.accounts c on b.sfdc_account_id = c.parent_id
+left join core.fleet_crm.accounts d on c.sfdc_account_id = d.parent_id
+left join core.fleet_crm.accounts e on d.sfdc_account_id = e.parent_id
+left join core.fleet_crm.accounts f on e.sfdc_account_id = f.parent_id
+left join core.fleet_crm.accounts g on f.sfdc_account_id = g.parent_id
+
+)
+, dupe as (
+select ultimate_parent_id, is_child_1_dupe+is_child_2_dupe+is_child_3_dupe+is_child_4_dupe+is_child_5_dupe+is_child_6_dupe as dupe_count from (
+select ultimate_parent_id, count( distinct case when account_status_reason_child_1 = 'Duplicate' then child_id_1 end) as is_child_1_dupe,
+            count( distinct case when account_status_reason_child_2 = 'Duplicate' then child_id_2 end) as is_child_2_dupe,
+            count( distinct case when account_status_reason_child_3 = 'Duplicate' then child_id_3 end) as is_child_3_dupe,
+            count( distinct case when account_status_reason_child_4 = 'Duplicate' then child_id_4 end) as is_child_4_dupe,
+            count( distinct case when account_status_reason_child_5 = 'Duplicate' then child_id_5 end) as is_child_5_dupe,
+            count( distinct case when account_status_reason_child_6 = 'Duplicate' then child_id_6 end) as is_child_6_dupe
+from hierarchy
+group by 1
+  )
+)
+, flag as (
+select ah.account_id as sfdc_account_id, ah.created_by_id as dedupe_owner_id, date(ah.created_date) as dedupe_date, u.name as dedupe_owner_name, ur.name as dedupe_owner_role
+from db_wh.salesforce.account_history ah
+left join db_wh.salesforce.user u on ah.created_by_id = u.id
+left join db_wh.salesforce.user_role ur on u.user_role_id = ur.id
+where new_value = 'Duplicate'
+and dedupe_date > dateadd(day,-30,current_date)
+)
+, activity as (
+select sfdc_account_id, count(*) as activity_count,
+        count(case when activity_type IN ('Call','Voicemail','Webinar','Phone','Meeting','Connect - Phone') then activity_id end) as call_count 
+from (
+    select sfdc_account_id, activity_id, activity_type, ACTIVITY_DATE, created_by_name, created_by_role, prospect_type
+    from core.bi_odl.activities ac
+    where created_date > dateadd(day,-30,current_date)
+     ) group by 1
+)
+, activity_90days as (
+select sfdc_account_id, count(*) as activity_count, 
+       count(case when activity_type IN ('Call','Voicemail','Webinar','Phone','Meeting','Connect - Phone') then activity_id end) as call_count 
+from (
+     select sfdc_account_id, activity_id, activity_type, ACTIVITY_DATE, created_by_name, created_by_role, prospect_type
+     from core.bi_odl.activities ac
+     where created_date > dateadd(day,-90,current_date)
+  ) group by 1
+)
+, contact_dupe as (
+select a.account_id, count(distinct a.id) as contact_dupe_count
+from db_wh.salesforce.contact a
+left join db_wh.salesforce.contact b on a.account_id = b.account_id and a.name = b.name and (a.phone = b.phone or a.email = b.email)
+where not a.is_deleted and not b.is_deleted
+and a.id <> b.id
+group by 1
+)
+, dupe_activity as (
+select ultimate_parent_id, child_1_dupe_activity_count+child_2_dupe_activity_count+child_3_dupe_activity_count+child_4_dupe_activity_count+child_5_dupe_activity_count+child_6_dupe_activity_count as dupe_activity from (
+select hierarchy.ultimate_parent_id, sum(case when account_status_reason_child_1 = 'Duplicate' and a.activity_count>0 then 1 end) as child_1_dupe_activity_count,
+            sum(case when account_status_reason_child_2 = 'Duplicate' and b.activity_count>0 then 1 end) as child_2_dupe_activity_count,
+            sum(case when account_status_reason_child_3 = 'Duplicate' and c.activity_count>0 then 1 end) as child_3_dupe_activity_count,
+            sum(case when account_status_reason_child_4 = 'Duplicate' and d.activity_count>0 then 1 end) as child_4_dupe_activity_count,
+            sum(case when account_status_reason_child_5 = 'Duplicate' and e.activity_count>0 then 1 end) as child_5_dupe_activity_count,
+            sum(case when account_status_reason_child_6 = 'Duplicate' and f.activity_count>0 then 1 end) as child_6_dupe_activity_count
+from hierarchy
+left join activity a on hierarchy.child_id_1 = a.sfdc_account_id
+left join activity b on hierarchy.child_id_2 = b.sfdc_account_id
+left join activity c on hierarchy.child_id_3 = c.sfdc_account_id
+left join activity d on hierarchy.child_id_4 = d.sfdc_account_id
+left join activity e on hierarchy.child_id_5 = e.sfdc_account_id
+left join activity f on hierarchy.child_id_6 = f.sfdc_account_id
+group by 1
+  )
+)
+, ultimate_hirarchy_lines as (
+select distinct a.id, ifnull(a.Ultimate_Parent_c, case when b.id is not null then a.id end) as ultimate_parent_id
+from db_wh.salesforce.account a
+left join db_wh.salesforce.account b on a.id = b.parent_id
+where not a.is_deleted and not b.is_deleted
+)
+, call_duration as (
+select sfdc_account_id, sum(CALL_DURATION_SECONDS) as Total_call_duration
+from core.bi_odl.activities
+ Group by 1
+)
+,base as (
+select a.id, a.name as account_name, a.account_status_2_c, a.account_status_reason_c,b.OWNER_NAME,ur.name,b.COMPOSITE_FLEET_SIZE,
+    //   case when enterprise_territory_management_c in ('DQ Approved Parent','DQ Approved Child') then TRUE else FALSE end as DQ_approved_account,
+    //   case when enterprise_territory_management_c in ('DQ Approved Parent') then TRUE else FALSE end as DQ_approved_parent_account,
+       case when a.account_status_2_c <> 'Disqualified' then TRUE else FALSE end as non_disqualified_accounts,
+       case when a.account_status_reason_c = 'Duplicate' then TRUE else FALSE end as MM_dupe_accounts,
+       case when not (a.kt_industry_c = 'Other' or a.kt_industry_c is null) then TRUE else FALSE end as industry_enriched,
+       case when not (a.annual_revenue = 0 or a.annual_revenue is null) then TRUE else FALSE end as revenue_enriched,
+       case when not (a.number_of_employees = 0 or a.number_of_employees is null) then TRUE else FALSE end as employee_count_enriched,
+       case when a.Billing_state is not Null then TRUE else FALSE end as Address_enriched,
+//       case when upper(a.shipping_city) = upper(a.ZI_Billing_City_c) then TRUE else FALSE end as hq_address_match,
+       case when a.website is not null then TRUE else FALSE end as website_enriched,
+       case when a.id in (select sfdc_account_id from dot where is_active) then TRUE else FALSE end as active_dot_enriched,
+       case when a.company_linked_in_url_c is not null then TRUE else FALSE end as linkedin_enriched,
+       composite_fleet_size,contact_count,
+       case when composite_fleet_size between 30 and 399 and contact_count >=3 then TRUE else FALSE end as contact_meet_SLA,
+       validated_email_count,
+       dupe_count,
+       case when dupe_count is not null or dupe_count >0 then TRUE else FALSE end as ENT_accounts_have_child_dupe,
+       dupe_activity,
+       contact_dupe_count,
+       case when a.account_status_2_c = 'Unqualified' then TRUE else FALSE end as unqualified_accounts,
+       case when ultimate_hirarchy_lines.ULTIMATE_PARENT_ID is not null then TRUE else FALSE end as ultimate_parent_hierarchies,
+       ultimate_hirarchy_lines.ULTIMATE_PARENT_ID,
+       case when a.id = ultimate_hirarchy_lines.ULTIMATE_PARENT_ID then TRUE else FALSE end as ULTIMATE_PARENT,
+       case when (ur.name in ('Enterprise Systems','Operations') or u.name = 'Adam Block') then TRUE else FALSE end as unassigned_accounts,
+       case when u.name = 'Adam Block' then TRUE else FALSE end as adam_assigned_accounts,
+       case when u.name = 'Kishen Mistry' then TRUE else FALSE end as kishen_assigned_accounts,
+       case when u.name = 'Frank Williams' then TRUE else FALSE end as fw_assigned_accounts,
+       case when u.name = 'Adam Block' and ultimate_parent_hierarchies then TRUE else FALSE end as adam_ultimate_parent_hierarchies,
+       case when (ur.name in ('Enterprise Systems','Operations') or u.name = 'Adam Block') and ultimate_parent_hierarchies and non_disqualified_accounts then TRUE else FALSE end as unassigned_ultimate_parent_hierarchies,
+       case when unassigned_accounts and a.enterprise_territory_management_c in ('DQ Approved Parent','DQ Approved Child') then TRUE else FALSE end as unassigned_DQ_approved_account,
+       case when (case when a.id in (select sfdc_account_id from activity where call_count > 0) then TRUE else FALSE end and ultimate_parent_hierarchies) then TRUE else FALSE end as ultimate_hierachies_called_30days,
+       case when (case when a.id in (select sfdc_account_id from activity_90days where call_count > 0) then TRUE else FALSE end and ultimate_parent_hierarchies) then TRUE else FALSE end as ultimate_hierachies_called_90days,
+       case when a.id in (select sfdc_account_id from activity where call_count > 0) then TRUE else FALSE end as called_30days,
+       case when a.id in (select sfdc_account_id from activity_90days where call_count > 0) then TRUE else FALSE end as called_90days, Total_call_duration
+
+from db_wh.salesforce.account a
+left join core.fleet_crm.accounts b on a.id = b.sfdc_account_id
+left join db_wh.salesforce.user u on a.owner_id = u.id
+left join db_wh.salesforce.user_role ur on u.user_role_id = ur.id
+left join contact_agg on a.id = contact_agg.account_id
+left join ultimate_hirarchy_lines on a.id = ultimate_hirarchy_lines.id
+left join dupe on a.id = dupe.ultimate_parent_id
+left join contact_dupe on a.id = contact_dupe.account_id
+left join dupe_activity on a.id = dupe_activity.ultimate_parent_id
+left join call_duration on a.id = call_duration.SFDC_ACCOUNT_ID
+where not is_deleted
+and composite_fleet_size between 30 and 399
+and (a.business_type_c not in ('Public Sector','Partnership') or a.business_type_c is null)
+and a.BILLING_COUNTRY Not in  ('Mexico', 'MX')
+and (a.STAMPED_ULTIMATE_PARENT_SEGMENT_C <> 'ENT' or a.STAMPED_ULTIMATE_PARENT_SEGMENT_C is null)
+)
+select ---DQ_approved_parent_account,
+       count(*) as cfs_100_750_accounts,
+       count(case when non_disqualified_accounts then id end) as MM_non_disqualified_accounts,
+    //   count(case when DQ_APPROVED_ACCOUNT then id end) as dq_MM_accounts,
+       count(case when unqualified_accounts then id end) as unqualified_accounts,
+//       count(case when ULTIMATE_PARENT_HIERARCHIES then id end) as ULTIMATE_PARENT_HIERARCHIES,
+       count(distinct ULTIMATE_PARENT_ID) as ULTIMATE_PARENT_LINES,
+       -----count(case when non_disqualified_accounts and ENT_accounts_have_child_dupe then id end) as ENT_accounts_have_child_dupe,
+       sum(case when non_disqualified_accounts then dupe_count end) as MM_hirarchy_child_account_dupes,
+       count(case when MM_dupe_accounts then id end) as MM_dupe_accounts,
+       count(case when non_disqualified_accounts and INDUSTRY_ENRICHED then id end) as industry_enriched,
+       count(case when non_disqualified_accounts and REVENUE_ENRICHED then id end) as revenue_enriched,
+       count(case when non_disqualified_accounts and EMPLOYEE_COUNT_ENRICHED then id end) as employee_count_enriched,
+       count(case when non_disqualified_accounts and ACTIVE_DOT_ENRICHED then id end) as active_dot,
+      count(case when non_disqualified_accounts and Address_enriched then id end) as Billing_address_match,
+       count(case when non_disqualified_accounts and WEBSITE_ENRICHED then id end) as website_enriched,
+       count(case when non_disqualified_accounts and LINKEDIN_ENRICHED then id end) as linkedin_enriched,
+       count(case when non_disqualified_accounts and CONTACT_MEET_SLA then id end) as contact_meet_sla,
+       avg(case when non_disqualified_accounts then CONTACT_COUNT end) as AVG_CONTACT_COUNT,
+       avg(case when non_disqualified_accounts then validated_email_count end) as AVG_validated_email_COUNT,
+       sum(contact_dupe_count) as contact_dupe_count,
+       sum(case when non_disqualified_accounts then dupe_activity end) as activity_on_dupes_in_30_days,
+//       count(DUPE_FLAGGED_PAST_30_DAYS) as account_flagged_dupe_in_30days,
+       count(case when UNASSIGNED_ACCOUNTS and non_disqualified_accounts then id end) as UNASSIGNED_ACCOUNTS,
+       count(case when ADAM_ASSIGNED_ACCOUNTS and non_disqualified_accounts then id end) as ADAM_ASSIGNED_ACCOUNTS,
+       count(case when kishen_ASSIGNED_ACCOUNTS and non_disqualified_accounts then id end) as kishen_ASSIGNED_ACCOUNTS,
+       count(case when fw_ASSIGNED_ACCOUNTS and non_disqualified_accounts then id end) as fw_ASSIGNED_ACCOUNTS,
+       count(distinct case when UNASSIGNED_ULTIMATE_PARENT_HIERARCHIES then Ultimate_Parent_id end) as UNASSIGNED_ULTIMATE_PARENT_HIERARCHIES,
+       count(distinct case when adam_ultimate_parent_hierarchies then Ultimate_Parent_id end) as adam_ultimate_parent_hierarchies,
+//       count(case when UNASSIGNED_DQ_APPROVED_ACCOUNT then id end) as UNASSIGNED_DQ_APPROVED_ACCOUNT,
+       count(distinct case when ULTIMATE_HIERACHIES_CALLED_30DAYS then Ultimate_Parent_id end) as ULTIMATE_HIERACHIES_CALLED_30DAYS,
+       count(distinct case when ULTIMATE_HIERACHIES_CALLED_90DAYS then Ultimate_Parent_id end) as ULTIMATE_HIERACHIES_CALLED_90DAYS,
+       count(case when CALLED_30DAYS then id end) as CALLED_30DAYS,
+       count(case when CALLED_90DAYS then id end) as CALLED_90DAYS,
+       Count(Case when Total_call_duration is null then id end ) as uncalled_counts,
+       sum(contact_count) as contact_count
+       
+from base;
+---group by 1"
